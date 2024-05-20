@@ -72,8 +72,9 @@ func buildGetMetricDataQueries(metric *request) types.MetricDataQuery {
 			},
 			Period: aws.Int32(int32(metric.Period / time.Second)),
 			Stat:   aws.String(metric.AwsAggregation),
-			Unit:   FetchStandardUnit(metric.Namespace, metric.MetricName),
+			//Unit:   FetchStandardUnit(metric.Namespace, metric.MetricName),
 		},
+		//Period: aws.Int32(int32(metric.Period / time.Second)),
 	})
 	return types.MetricDataQuery{
 		Id:         aws.String(fmt.Sprintf("m_%d", rand.Int())),
@@ -86,8 +87,9 @@ func buildGetMetricDataQueries(metric *request) types.MetricDataQuery {
 			},
 			Period: aws.Int32(int32(metric.Period / time.Second)),
 			Stat:   aws.String(metric.AwsAggregation),
-			Unit:   FetchStandardUnit(metric.Namespace, metric.MetricName),
+			//Unit:   FetchStandardUnit(metric.Namespace, metric.MetricName),
 		},
+		//Period: aws.Int32(int32(metric.Period / time.Second)),
 	}
 }
 
@@ -239,15 +241,12 @@ func (m *metricReceiver) pollForMetrics(ctx context.Context, startTime time.Time
 				filter.NextToken = nextToken
 			}
 			output, err := m.client.GetMetricData(ctx, &filter)
-			log.Println("MetricDataQueries====>")
-			PrintJson(filter.MetricDataQueries)
-			log.Println("============================>")
-			PrintJson(output)
 			nextToken = output.NextToken
 			if err != nil {
 				m.logger.Error("unable to retrieve metric data from cloudwatch", zap.Error(err))
 				continue
 			}
+
 			observedTime := pcommon.NewTimestampFromTime(time.Now())
 			metrics := m.parseMetrics(ctx, observedTime, m.requests, output)
 			if metrics.MetricCount() > 0 {
@@ -318,8 +317,8 @@ func (m *metricReceiver) parseMetrics(ctx context.Context, nowts pcommon.Timesta
 	ms := ilm.Metrics()
 	ms.EnsureCapacity(len(m.requests))
 	//atts := make(map[string]interface{})
-	log.Println("resp: ")
-	PrintJson(resp)
+	//log.Println("resp: ")
+	//PrintJson(resp)
 	for idx, results := range resp.MetricDataResults {
 		log.Println("Metric Result--------------->")
 		PrintJson(results)
@@ -329,6 +328,8 @@ func (m *metricReceiver) parseMetrics(ctx context.Context, nowts pcommon.Timesta
 			now := time.Now()
 			results.Timestamps = append(results.Timestamps, now)
 			results.Values = append(results.Values, 0)
+		} else {
+			log.Println("non-empty----------->")
 		}
 
 		standardUnit := FetchStandardUnit(nr[idx].Namespace, nr[idx].MetricName)
