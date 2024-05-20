@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"math/rand"
 	"sync"
 	"time"
@@ -50,36 +51,6 @@ type request struct {
 	Dimensions     []types.Dimension
 }
 
-var EC2MetricToUnit = map[string]types.StandardUnit{
-	"CPUUtilization":                types.StandardUnitPercent,
-	"DiskReadOps":                   types.StandardUnitCount,
-	"DiskWriteOps":                  types.StandardUnitCount,
-	"DiskReadBytes":                 types.StandardUnitBytes,
-	"DiskWriteBytes":                types.StandardUnitBytes,
-	"NetworkIn":                     types.StandardUnitBytes,
-	"NetworkOut":                    types.StandardUnitBytes,
-	"NetworkPacketsIn":              types.StandardUnitCount,
-	"NetworkPacketsOut":             types.StandardUnitCount,
-	"CPUCreditUsage":                types.StandardUnitCount,
-	"CPUCreditBalance":              types.StandardUnitCount,
-	"CPUSurplusCreditBalance":       types.StandardUnitCount,
-	"CPUSurplusCreditsCharged":      types.StandardUnitCount,
-	"DedicatedHOstCPUUtilization":   types.StandardUnitPercent,
-	"EBSReadOps":                    types.StandardUnitCount,
-	"EBSWriteOps":                   types.StandardUnitCount,
-	"EBSReadBytes":                  types.StandardUnitBytes,
-	"EBSWriteBytes":                 types.StandardUnitBytes,
-	"MetadataNoToken":               types.StandardUnitCount,
-	"EBSIOBalance%":                 types.StandardUnitPercent,
-	"EBSByteBalance%":               types.StandardUnitBytes,
-	"StatusCheckFailed":             types.StandardUnitCount,
-	"StatusCheckFailed_Instance":    types.StandardUnitCount,
-	"StatusCheckFailed_System":      types.StandardUnitCount,
-	"StatusCheckFailed_AttachedEBS": types.StandardUnitCount,
-	"VolumeStalledIOCheck":          types.StandardUnitCount,
-	"MemoryUtilization":             types.StandardUnitPercent,
-}
-
 // CloudWatchAPI is an interface to represent subset of AWS CloudWatch metrics functionality.
 type client interface {
 	GetMetricData(ctx context.Context, params *cloudwatch.GetMetricDataInput, optFns ...func(*cloudwatch.Options)) (*cloudwatch.GetMetricDataOutput, error)
@@ -87,21 +58,37 @@ type client interface {
 }
 
 func buildGetMetricDataQueries(metric *request) types.MetricDataQuery {
-	mdq := types.MetricDataQuery{
+	log.Println("metricmetric=>")
+	PrintJson(metric)
+	log.Println("final=>")
+	PrintJson(types.MetricDataQuery{
 		Id:         aws.String(fmt.Sprintf("m_%d", rand.Int())),
 		ReturnData: aws.Bool(true),
-	}
-	mdq.MetricStat = &types.MetricStat{
-		Metric: &types.Metric{
-			Namespace:  aws.String(metric.Namespace),
-			MetricName: aws.String(metric.MetricName),
-			Dimensions: metric.Dimensions,
+		MetricStat: &types.MetricStat{
+			Metric: &types.Metric{
+				Namespace:  aws.String(metric.Namespace),
+				MetricName: aws.String(metric.MetricName),
+				Dimensions: metric.Dimensions,
+			},
+			Period: aws.Int32(int32(metric.Period / time.Second)),
+			Stat:   aws.String(metric.AwsAggregation),
+			Unit:   FetchStandardUnit(metric.Namespace, metric.MetricName),
 		},
-		Period: aws.Int32(int32(metric.Period / time.Second)),
-		Stat:   aws.String(metric.AwsAggregation),
-		Unit:   EC2MetricToUnit[metric.MetricName],
+	})
+	return types.MetricDataQuery{
+		Id:         aws.String(fmt.Sprintf("m_%d", rand.Int())),
+		ReturnData: aws.Bool(true),
+		MetricStat: &types.MetricStat{
+			Metric: &types.Metric{
+				Namespace:  aws.String(metric.Namespace),
+				MetricName: aws.String(metric.MetricName),
+				Dimensions: metric.Dimensions,
+			},
+			Period: aws.Int32(int32(metric.Period / time.Second)),
+			Stat:   aws.String(metric.AwsAggregation),
+			Unit:   FetchStandardUnit(metric.Namespace, metric.MetricName),
+		},
 	}
-	return mdq
 }
 
 func chunkSlice(requests []request, maxSize int) [][]request {
@@ -252,13 +239,17 @@ func (m *metricReceiver) pollForMetrics(ctx context.Context, startTime time.Time
 				filter.NextToken = nextToken
 			}
 			output, err := m.client.GetMetricData(ctx, &filter)
+			log.Println("MetricDataQueries====>")
+			PrintJson(filter.MetricDataQueries)
+			log.Println("============================>")
+			PrintJson(output)
 			nextToken = output.NextToken
 			if err != nil {
 				m.logger.Error("unable to retrieve metric data from cloudwatch", zap.Error(err))
 				continue
 			}
 			observedTime := pcommon.NewTimestampFromTime(time.Now())
-			metrics := m.parseMetrics(observedTime, m.requests, output)
+			metrics := m.parseMetrics(ctx, observedTime, m.requests, output)
 			if metrics.MetricCount() > 0 {
 				if err := m.consumer.ConsumeMetrics(ctx, metrics); err != nil {
 					m.logger.Error("unable to consume metrics", zap.Error(err))
@@ -269,36 +260,90 @@ func (m *metricReceiver) pollForMetrics(ctx context.Context, startTime time.Time
 	return nil
 }
 
-func (m *metricReceiver) parseMetrics(nowts pcommon.Timestamp, nr []request, resp *cloudwatch.GetMetricDataOutput) pmetric.Metrics {
+func (m *metricReceiver) getAWSAccessKeyID(ctx context.Context) (string, error) {
+	// Load AWS SDK configuration from default sources
+	cfg, err := config.LoadDefaultConfig(ctx)
+	if err != nil {
+		return "", err
+	}
+
+	// Access AWS credentials
+	creds, err := cfg.Credentials.Retrieve(ctx)
+	if err != nil {
+		return "", err
+	}
+
+	return creds.AccessKeyID, nil
+}
+
+func convertValueAndUnit(value float64, standardUnit types.StandardUnit, otelUnit string) (float64, string) {
+	switch standardUnit {
+	case StandardUnitMinutes:
+		// Convert from Minutes to Seconds
+		value *= 60
+		otelUnit = "s"
+	case StandardUnitGibibytes:
+		// Convert from Gibibytes to Gigabytes
+		value *= 1.073741824 // Conversion factor: 1024^3 / 1000^3
+		otelUnit = "GBy"
+	case StandardUnitMebibytes:
+		// Convert from Mebibytes to Megabytes
+		value *= 1.048576 // Conversion factor: 1024^2 / 1000^2
+		otelUnit = "MBy"
+	}
+	return value, otelUnit
+}
+
+func (m *metricReceiver) parseMetrics(ctx context.Context, nowts pcommon.Timestamp, nr []request, resp *cloudwatch.GetMetricDataOutput) pmetric.Metrics {
+
 	pdm := pmetric.NewMetrics()
 	rms := pdm.ResourceMetrics()
-
 	rm := rms.AppendEmpty()
 
 	resourceAttrs := rm.Resource().Attributes()
 	resourceAttrs.PutStr(conventions.AttributeCloudProvider, conventions.AttributeCloudProviderAWS)
 	resourceAttrs.PutStr(conventions.AttributeCloudRegion, m.region)
+	resourceAttrs.PutStr("channel", conventions.AttributeCloudProviderAWS)
+
+	// Temporary for now, until we find cloud.account.id
+	accessKeyID, err := m.getAWSAccessKeyID(ctx)
+	if err != nil {
+		m.logger.Error("Error retrieving AWS credentials:", zap.Error(err))
+		return pdm
+	}
+	resourceAttrs.PutStr("cloud.account.id", accessKeyID)
 
 	ilms := rm.ScopeMetrics()
 	ilm := ilms.AppendEmpty()
 	ms := ilm.Metrics()
 	ms.EnsureCapacity(len(m.requests))
 	//atts := make(map[string]interface{})
+	log.Println("resp: ")
+	PrintJson(resp)
 	for idx, results := range resp.MetricDataResults {
+		log.Println("Metric Result--------------->")
+		PrintJson(results)
 		if len(results.Timestamps) == 0 {
-			m.logger.Debug("no data points found for metric", zap.String("metric", nr[idx].MetricName))
-			continue
+			//m.logger.Debug("no data points found for metric", zap.String("metric", nr[idx].MetricName))
+			// continue
+			now := time.Now()
+			results.Timestamps = append(results.Timestamps, now)
+			results.Values = append(results.Values, 0)
 		}
+
+		standardUnit := FetchStandardUnit(nr[idx].Namespace, nr[idx].MetricName)
+		otelUnit := FetchOtelUnit(standardUnit)
+
 		mdp := ms.AppendEmpty()
 		mdp.SetName(fmt.Sprintf("%s.%s", nr[idx].Namespace, nr[idx].MetricName))
 		mdp.SetDescription(fmt.Sprintf("CloudWatch metric %s", nr[idx].MetricName))
-		unit := EC2MetricToUnit[nr[idx].MetricName]
-		mdp.SetUnit(string(unit))
-		var dps pmetric.NumberDataPointSlice
+		dps := mdp.SetEmptyGauge().DataPoints()
+
+		/*var dps pmetric.NumberDataPointSlice
 		switch unit {
-		case types.StandardUnitCount:
-			fallthrough
-		case types.StandardUnitBytes:
+		case types.StandardUnitCount, types.StandardUnitBytes,
+			types.StandardUnitBits, types.StandardUnitBytesSecond,
+			types.StandardUnitMilliseconds, types.StandardUnitSeconds:
 			sum := mdp.SetEmptySum()
 			sum.SetAggregationTemporality(pmetric.AggregationTemporalityCumulative)
 			sum.SetIsMonotonic(true)
@@ -312,23 +357,27 @@ func (m *metricReceiver) parseMetrics(nowts pcommon.Timestamp, nr []request, res
 			m.logger.Debug("unsupported unit", zap.String("unit", string(unit)),
 				zap.String("metric", nr[idx].MetricName))
 			continue
-		}
-
-		/*for _, dim := range nr.Dimensions {
-			atts[*dim.Name] = dim.Value
 		}*/
 
 		// number of values *always* equals number of timestamps
 		for point := range results.Values {
 			ts, value := results.Timestamps[point], results.Values[point]
+
+			// Convert value and unit if necessary
+			value, otelUnit = convertValueAndUnit(value, standardUnit, otelUnit)
+
 			dp := dps.AppendEmpty()
 			dp.SetTimestamp(nowts)
 			dp.SetStartTimestamp(pcommon.NewTimestampFromTime(ts))
 			dp.SetDoubleValue(value)
+			log.Println("Namespace : ", nr[idx].Namespace, ", Metric : ", nr[idx].MetricName, ", Value : ", value)
 			for _, dim := range nr[idx].Dimensions {
 				dp.Attributes().PutStr(*dim.Name, *dim.Value)
 			}
+			dp.Attributes().PutStr("awsUnit", string(standardUnit))
+			dp.Attributes().PutStr("otelUnit", otelUnit)
 		}
+		mdp.SetUnit(otelUnit)
 	}
 	return pdm
 }
@@ -336,7 +385,7 @@ func (m *metricReceiver) parseMetrics(nowts pcommon.Timestamp, nr []request, res
 func (m *metricReceiver) autoDiscoverRequests(ctx context.Context, auto *AutoDiscoverConfig) ([]request, error) {
 	m.logger.Debug("discovering metrics", zap.String("namespace", auto.Namespace))
 
-	requests := []request{}
+	var requests []request
 	input := &cloudwatch.ListMetricsInput{
 		Namespace: aws.String(auto.Namespace),
 	}
@@ -347,18 +396,23 @@ func (m *metricReceiver) autoDiscoverRequests(ctx context.Context, auto *AutoDis
 			input.NextToken = nextToken
 		}
 		out, err := m.client.ListMetrics(ctx, input)
+		//log.Println("out==>")
+		//PrintJson(out)
 		if err != nil {
 			return nil, err
 		}
 
 		for _, metric := range out.Metrics {
 			if len(requests) > auto.Limit {
-				m.logger.Debug("reached limit of number of metrics, try increasing the limit config to increase the number of individial metrics polled")
+				m.logger.Debug("reached limit of number of metrics, try increasing the limit config to increase the number of individual metrics polled")
 				break
 			}
-			requests = append(requests, request{Namespace: *metric.Namespace,
-				MetricName: *metric.MetricName, Period: auto.Period,
-				AwsAggregation: auto.AwsAggregation, Dimensions: metric.Dimensions,
+			requests = append(requests, request{
+				Namespace:      *metric.Namespace,
+				MetricName:     *metric.MetricName,
+				Dimensions:     metric.Dimensions,
+				Period:         auto.Period,
+				AwsAggregation: auto.AwsAggregation,
 			})
 		}
 
@@ -381,6 +435,9 @@ func (m *metricReceiver) configureAWSClient(ctx context.Context) error {
 	// if "", helper functions (withXXX) ignores parameter
 	cfg, err := config.LoadDefaultConfig(ctx,
 		config.WithRegion(m.region), config.WithEC2IMDSEndpoint(m.imdsEndpoint), config.WithSharedConfigProfile(m.profile))
+	if err != nil {
+		return err
+	}
 	m.client = cloudwatch.NewFromConfig(cfg)
-	return err
+	return nil
 }
