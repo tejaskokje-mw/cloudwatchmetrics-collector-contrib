@@ -367,8 +367,10 @@ func (m *metricReceiver) parseMetrics(ctx context.Context, nowts pcommon.Timesta
 			for _, dim := range nr[idx].Dimensions {
 				dp.Attributes().PutStr(*dim.Name, *dim.Value)
 			}
-			dp.Attributes().PutStr("awsUnit", string(standardUnit))
-			dp.Attributes().PutStr("otelUnit", otelUnit)
+			dp.Attributes().PutStr("Namespace", nr[idx].Namespace)
+			dp.Attributes().PutStr("MetricName", nr[idx].MetricName)
+			dp.Attributes().PutStr("AWSUnit", string(standardUnit))
+			dp.Attributes().PutStr("OTELUnit", otelUnit)
 		}
 		mdp.SetUnit(otelUnit)
 	}
