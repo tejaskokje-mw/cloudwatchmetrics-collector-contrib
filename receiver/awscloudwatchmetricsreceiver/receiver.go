@@ -58,24 +58,6 @@ type client interface {
 }
 
 func buildGetMetricDataQueries(metric *request) types.MetricDataQuery {
-	log.Println("metricmetric=>")
-	PrintJson(metric)
-	log.Println("final=>")
-	PrintJson(types.MetricDataQuery{
-		Id:         aws.String(fmt.Sprintf("m_%d", rand.Int())),
-		ReturnData: aws.Bool(true),
-		MetricStat: &types.MetricStat{
-			Metric: &types.Metric{
-				Namespace:  aws.String(metric.Namespace),
-				MetricName: aws.String(metric.MetricName),
-				Dimensions: metric.Dimensions,
-			},
-			Period: aws.Int32(int32(metric.Period / time.Second)),
-			Stat:   aws.String(metric.AwsAggregation),
-			//Unit:   FetchStandardUnit(metric.Namespace, metric.MetricName),
-		},
-		//Period: aws.Int32(int32(metric.Period / time.Second)),
-	})
 	return types.MetricDataQuery{
 		Id:         aws.String(fmt.Sprintf("m_%d", rand.Int())),
 		ReturnData: aws.Bool(true),
@@ -89,7 +71,6 @@ func buildGetMetricDataQueries(metric *request) types.MetricDataQuery {
 			Stat:   aws.String(metric.AwsAggregation),
 			//Unit:   FetchStandardUnit(metric.Namespace, metric.MetricName),
 		},
-		//Period: aws.Int32(int32(metric.Period / time.Second)),
 	}
 }
 
@@ -227,7 +208,7 @@ func (m *metricReceiver) poll(ctx context.Context) error {
 	return errs
 }
 
-func (m *metricReceiver) pollForMetrics(ctx context.Context, startTime time.Time, endTime time.Time) error {
+/*func (m *metricReceiver) pollForMetricsBackup(ctx context.Context, startTime time.Time, endTime time.Time) error {
 	select {
 	case _, ok := <-m.doneChan:
 		if !ok {
@@ -252,6 +233,37 @@ func (m *metricReceiver) pollForMetrics(ctx context.Context, startTime time.Time
 			if metrics.MetricCount() > 0 {
 				if err := m.consumer.ConsumeMetrics(ctx, metrics); err != nil {
 					m.logger.Error("unable to consume metrics", zap.Error(err))
+				}
+			}
+		}
+	}
+	return nil
+}*/
+
+func (m *metricReceiver) pollForMetrics(ctx context.Context, startTime time.Time, endTime time.Time) error {
+	select {
+	case _, ok := <-m.doneChan:
+		if !ok {
+			return nil
+		}
+	default:
+		filters := m.request(startTime, endTime)
+		for _, filter := range filters {
+			// Step2: Work similar to GetMetricData()
+			paginator := cloudwatch.NewGetMetricDataPaginator(m.client, &filter)
+			for paginator.HasMorePages() {
+				output, err := paginator.NextPage(ctx)
+				if err != nil {
+					m.logger.Error("unable to retrieve metric data from cloudwatch", zap.Error(err))
+					continue
+				}
+				observedTime := pcommon.NewTimestampFromTime(time.Now())
+				metrics := m.parseMetrics(ctx, observedTime, m.requests, output)
+				if metrics.MetricCount() > 0 {
+					if err := m.consumer.ConsumeMetrics(ctx, metrics); err != nil {
+						m.logger.Error("unable to consume metrics", zap.Error(err))
+						break
+					}
 				}
 			}
 		}
@@ -340,26 +352,6 @@ func (m *metricReceiver) parseMetrics(ctx context.Context, nowts pcommon.Timesta
 		mdp.SetDescription(fmt.Sprintf("CloudWatch metric %s", nr[idx].MetricName))
 		dps := mdp.SetEmptyGauge().DataPoints()
 
-		/*var dps pmetric.NumberDataPointSlice
-		switch unit {
-		case types.StandardUnitCount, types.StandardUnitBytes,
-			types.StandardUnitBits, types.StandardUnitBytesSecond,
-			types.StandardUnitMilliseconds, types.StandardUnitSeconds:
-			sum := mdp.SetEmptySum()
-			sum.SetAggregationTemporality(pmetric.AggregationTemporalityCumulative)
-			sum.SetIsMonotonic(true)
-			dps = sum.DataPoints()
-		case types.StandardUnitPercent:
-			//mdp.SetAggregationTemporality(pmetric.AggregationTemporalityDelta)
-			gauge := mdp.SetEmptyGauge()
-			gauge.DataPoints()
-			dps = gauge.DataPoints()
-		default:
-			m.logger.Debug("unsupported unit", zap.String("unit", string(unit)),
-				zap.String("metric", nr[idx].MetricName))
-			continue
-		}*/
-
 		// number of values *always* equals number of timestamps
 		for point := range results.Values {
 			ts, value := results.Timestamps[point], results.Values[point]
@@ -383,7 +375,7 @@ func (m *metricReceiver) parseMetrics(ctx context.Context, nowts pcommon.Timesta
 	return pdm
 }
 
-func (m *metricReceiver) autoDiscoverRequests(ctx context.Context, auto *AutoDiscoverConfig) ([]request, error) {
+/*func (m *metricReceiver) autoDiscoverRequestsBackup(ctx context.Context, auto *AutoDiscoverConfig) ([]request, error) {
 	m.logger.Debug("discovering metrics", zap.String("namespace", auto.Namespace))
 
 	var requests []request
@@ -424,6 +416,37 @@ func (m *metricReceiver) autoDiscoverRequests(ctx context.Context, auto *AutoDis
 		input.NextToken = out.NextToken
 	}
 
+	m.logger.Debug("number of metrics discovered", zap.Int("metrics", len(requests)))
+	return requests, nil
+}*/
+
+func (m *metricReceiver) autoDiscoverRequests(ctx context.Context, auto *AutoDiscoverConfig) ([]request, error) {
+	m.logger.Debug("discovering metrics", zap.String("namespace", auto.Namespace))
+
+	var requests []request
+	// Step1: Work similar to ListMetrics()
+	paginator := cloudwatch.NewListMetricsPaginator(m.client, &cloudwatch.ListMetricsInput{
+		Namespace:      aws.String(auto.Namespace),
+		RecentlyActive: "PT3H",
+	})
+	for paginator.HasMorePages() {
+		if len(requests) > auto.Limit {
+			m.logger.Debug(auto.Namespace + ": reached limit of number of metrics, try increasing the limit config to increase the number of individual metrics polled")
+		}
+		out, err := paginator.NextPage(ctx)
+		if err != nil {
+			return nil, err
+		}
+		for _, metric := range out.Metrics {
+			requests = append(requests, request{
+				Namespace:      *metric.Namespace,
+				MetricName:     *metric.MetricName,
+				Period:         auto.Period,
+				AwsAggregation: auto.AwsAggregation,
+				Dimensions:     metric.Dimensions,
+			})
+		}
+	}
 	m.logger.Debug("number of metrics discovered", zap.Int("metrics", len(requests)))
 	return requests, nil
 }
