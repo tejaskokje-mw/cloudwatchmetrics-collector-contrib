@@ -7,10 +7,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
 	"math/rand"
 	"strconv"
-	"strings"
 	"sync"
 	"time"
 
@@ -60,25 +58,11 @@ type client interface {
 }
 
 func buildGetMetricDataQueries(metric *request, id int) types.MetricDataQuery {
-
-	log.Println("#########Namespace: ", metric.Namespace)
-	log.Println("#########MetricName: ", metric.MetricName)
-	log.Println("#########Period: ", int32(metric.Period/time.Second))
-	log.Println("#########Aggregation: ", metric.AwsAggregation)
-	instanceID := metric.Namespace
-	for _, dimension := range metric.Dimensions {
-		log.Println("#########Dimension: ", *dimension.Name, *dimension.Value)
-		if *dimension.Name == "InstanceId" {
-			instanceID = *dimension.Value
-		}
-	}
-
 	return types.MetricDataQuery{
 		Id:         aws.String(fmt.Sprintf("m_%d", rand.Int())),
 		ReturnData: aws.Bool(true),
-		Label:      aws.String(fmt.Sprintf("%d:%s:%s", id, metric.MetricName, instanceID)),
+		Label:      aws.String(fmt.Sprintf("%d", id)),
 		MetricStat: &types.MetricStat{
-
 			Metric: &types.Metric{
 				Namespace:  aws.String(metric.Namespace),
 				MetricName: aws.String(metric.MetricName),
@@ -86,7 +70,6 @@ func buildGetMetricDataQueries(metric *request, id int) types.MetricDataQuery {
 			},
 			Period: aws.Int32(int32(metric.Period / time.Second)),
 			Stat:   aws.String(metric.AwsAggregation),
-			//Unit:   "Percent",
 			//Unit:   FetchStandardUnit(metric.Namespace, metric.MetricName),
 		},
 	}
@@ -96,7 +79,6 @@ func chunkSlice(requests []request, maxSize int) [][]request {
 	var slicedMetrics [][]request
 	for i := 0; i < len(requests); i += maxSize {
 		end := i + maxSize
-
 		if end > len(requests) {
 			end = len(requests)
 		}
@@ -118,7 +100,7 @@ func (m *metricReceiver) request(st, et time.Time) []cloudwatch.GetMetricDataInp
 		for ydx := range chunk {
 			metricDataInput[idx].StartTime, metricDataInput[idx].EndTime = aws.Time(st), aws.Time(et)
 			metricDataInput[idx].MetricDataQueries =
-				append(metricDataInput[idx].MetricDataQueries, buildGetMetricDataQueries(&chunk[ydx], idx*500+ydx))
+				append(metricDataInput[idx].MetricDataQueries, buildGetMetricDataQueries(&chunk[ydx], (idx*maxNumberOfElements)+ydx))
 		}
 	}
 	return metricDataInput
@@ -139,15 +121,13 @@ func newMetricReceiver(cfg *Config, logger *zap.Logger, consumer consumer.Metric
 					})
 				}
 
-				namedRequest := request{
+				requests = append(requests, request{
 					Namespace:      group.Namespace,
 					MetricName:     namedConfig.MetricName,
 					Period:         group.Period,
 					AwsAggregation: namedConfig.AwsAggregation,
 					Dimensions:     dimensions,
-				}
-
-				requests = append(requests, namedRequest)
+				})
 			}
 		}
 	}
@@ -184,9 +164,9 @@ func (m *metricReceiver) Shutdown(_ context.Context) error {
 func (m *metricReceiver) startPolling(ctx context.Context) {
 	defer m.wg.Done()
 
-	err := m.configureAWSClient(ctx)
-	if err != nil {
+	if err := m.configureAWSClient(ctx); err != nil {
 		m.logger.Error("unable to establish connection to cloudwatch", zap.Error(err))
+		return
 	}
 
 	t := time.NewTicker(m.pollInterval)
@@ -205,10 +185,8 @@ func (m *metricReceiver) startPolling(ctx context.Context) {
 					continue
 				}
 				m.requests = requests
-
 			}
-			err := m.poll(ctx)
-			if err != nil {
+			if err := m.poll(ctx); err != nil {
 				m.logger.Error("there was an error during polling", zap.Error(err))
 			}
 		}
@@ -226,6 +204,7 @@ func (m *metricReceiver) poll(ctx context.Context) error {
 	return errs
 }
 
+// pollForMetrics: Without paginator functionality
 /*func (m *metricReceiver) pollForMetricsBackup(ctx context.Context, startTime time.Time, endTime time.Time) error {
 	select {
 	case _, ok := <-m.doneChan:
@@ -324,7 +303,6 @@ func convertValueAndUnit(value float64, standardUnit types.StandardUnit, otelUni
 }
 
 func (m *metricReceiver) parseMetrics(ctx context.Context, nowts pcommon.Timestamp, nr []request, resp *cloudwatch.GetMetricDataOutput) pmetric.Metrics {
-
 	pdm := pmetric.NewMetrics()
 	rms := pdm.ResourceMetrics()
 	rm := rms.AppendEmpty()
@@ -347,37 +325,28 @@ func (m *metricReceiver) parseMetrics(ctx context.Context, nowts pcommon.Timesta
 	ms := ilm.Metrics()
 	ms.EnsureCapacity(len(m.requests))
 	//atts := make(map[string]interface{})
-	log.Println("resp: ")
-	PrintJson(resp)
-	log.Println("nr: ")
-	PrintJson(nr)
 
 	for idx, results := range resp.MetricDataResults {
-		log.Println("Metric Result--------------->")
-		PrintJson(results)
 
-		labels := strings.Split(*results.Label, ":")
-		requestId, err := strconv.Atoi(labels[0])
+		reqIndex, err := strconv.Atoi(*results.Label)
 		if err != nil {
-			log.Println("Error converting label to int")
+			m.logger.Debug("illegal metric label", zap.Error(err))
 			continue
 		}
+
 		if len(results.Timestamps) == 0 {
-			//m.logger.Debug("no data points found for metric", zap.String("metric", nr[idx].MetricName))
-			// continue
 			now := time.Now()
 			results.Timestamps = append(results.Timestamps, now)
 			results.Values = append(results.Values, 0)
-		} else {
-			//log.Println("non-empty----------->")
 		}
 
-		standardUnit := FetchStandardUnit(nr[requestId].Namespace, nr[requestId].MetricName)
+		req := nr[reqIndex]
+		standardUnit := FetchStandardUnit(req.Namespace, req.MetricName)
 		otelUnit := FetchOtelUnit(standardUnit)
 
 		mdp := ms.AppendEmpty()
-		mdp.SetName(fmt.Sprintf("%s.%s", nr[requestId].Namespace, nr[requestId].MetricName))
-		mdp.SetDescription(fmt.Sprintf("CloudWatch metric %s", nr[requestId].MetricName))
+		mdp.SetName(fmt.Sprintf("%s.%s", req.Namespace, req.MetricName))
+		mdp.SetDescription(fmt.Sprintf("CloudWatch metric %s", req.MetricName))
 		dps := mdp.SetEmptyGauge().DataPoints()
 
 		// number of values *always* equals number of timestamps
@@ -391,22 +360,22 @@ func (m *metricReceiver) parseMetrics(ctx context.Context, nowts pcommon.Timesta
 			dp.SetTimestamp(nowts)
 			dp.SetStartTimestamp(pcommon.NewTimestampFromTime(ts))
 			dp.SetDoubleValue(value)
-			log.Println("Namespace : ", nr[requestId].Namespace, ", Metric : ", nr[requestId].MetricName, ", Value : ", value)
+
 			for _, dim := range nr[idx].Dimensions {
 				dp.Attributes().PutStr(*dim.Name, *dim.Value)
 			}
 
-			dp.Attributes().PutStr("Namespace", nr[requestId].Namespace)
-			dp.Attributes().PutStr("MetricName", nr[requestId].MetricName)
+			dp.Attributes().PutStr("Namespace", req.Namespace)
+			dp.Attributes().PutStr("MetricName", req.MetricName)
 			dp.Attributes().PutStr("AWSUnit", string(standardUnit))
 			dp.Attributes().PutStr("OTELUnit", otelUnit)
 		}
 		mdp.SetUnit(otelUnit)
 	}
-
 	return pdm
 }
 
+// autoDiscoverRequests: Without paginator functionality
 /*func (m *metricReceiver) autoDiscoverRequestsBackup(ctx context.Context, auto *AutoDiscoverConfig) ([]request, error) {
 	m.logger.Debug("discovering metrics", zap.String("namespace", auto.Namespace))
 
@@ -421,11 +390,8 @@ func (m *metricReceiver) parseMetrics(ctx context.Context, nowts pcommon.Timesta
 			input.NextToken = nextToken
 		}
 		out, err := m.client.ListMetrics(ctx, input)
-		//log.Println("out==>")
-		//PrintJson(out)
 		if err != nil {
 			return nil, err
-
 		}
 
 		for _, metric := range out.Metrics {
@@ -491,7 +457,10 @@ func (m *metricReceiver) configureAWSClient(ctx context.Context) error {
 
 	// if "", helper functions (withXXX) ignores parameter
 	cfg, err := config.LoadDefaultConfig(ctx,
-		config.WithRegion(m.region), config.WithEC2IMDSEndpoint(m.imdsEndpoint), config.WithSharedConfigProfile(m.profile))
+		config.WithRegion(m.region),
+		config.WithSharedConfigProfile(m.profile),
+		config.WithEC2IMDSEndpoint(m.imdsEndpoint),
+	)
 	if err != nil {
 		return err
 	}
