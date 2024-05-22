@@ -9,6 +9,8 @@ import (
 	"fmt"
 	"log"
 	"math/rand"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -57,11 +59,26 @@ type client interface {
 	ListMetrics(ctx context.Context, params *cloudwatch.ListMetricsInput, optFns ...func(*cloudwatch.Options)) (*cloudwatch.ListMetricsOutput, error)
 }
 
-func buildGetMetricDataQueries(metric *request) types.MetricDataQuery {
+func buildGetMetricDataQueries(metric *request, id int) types.MetricDataQuery {
+
+	log.Println("#########Namespace: ", metric.Namespace)
+	log.Println("#########MetricName: ", metric.MetricName)
+	log.Println("#########Period: ", int32(metric.Period/time.Second))
+	log.Println("#########Aggregation: ", metric.AwsAggregation)
+	instanceID := metric.Namespace
+	for _, dimension := range metric.Dimensions {
+		log.Println("#########Dimension: ", *dimension.Name, *dimension.Value)
+		if *dimension.Name == "InstanceId" {
+			instanceID = *dimension.Value
+		}
+	}
+
 	return types.MetricDataQuery{
 		Id:         aws.String(fmt.Sprintf("m_%d", rand.Int())),
 		ReturnData: aws.Bool(true),
+		Label:      aws.String(fmt.Sprintf("%d:%s:%s", id, metric.MetricName, instanceID)),
 		MetricStat: &types.MetricStat{
+
 			Metric: &types.Metric{
 				Namespace:  aws.String(metric.Namespace),
 				MetricName: aws.String(metric.MetricName),
@@ -69,6 +86,7 @@ func buildGetMetricDataQueries(metric *request) types.MetricDataQuery {
 			},
 			Period: aws.Int32(int32(metric.Period / time.Second)),
 			Stat:   aws.String(metric.AwsAggregation),
+			//Unit:   "Percent",
 			//Unit:   FetchStandardUnit(metric.Namespace, metric.MetricName),
 		},
 	}
@@ -100,7 +118,7 @@ func (m *metricReceiver) request(st, et time.Time) []cloudwatch.GetMetricDataInp
 		for ydx := range chunk {
 			metricDataInput[idx].StartTime, metricDataInput[idx].EndTime = aws.Time(st), aws.Time(et)
 			metricDataInput[idx].MetricDataQueries =
-				append(metricDataInput[idx].MetricDataQueries, buildGetMetricDataQueries(&chunk[ydx]))
+				append(metricDataInput[idx].MetricDataQueries, buildGetMetricDataQueries(&chunk[ydx], idx*500+ydx))
 		}
 	}
 	return metricDataInput
@@ -329,11 +347,21 @@ func (m *metricReceiver) parseMetrics(ctx context.Context, nowts pcommon.Timesta
 	ms := ilm.Metrics()
 	ms.EnsureCapacity(len(m.requests))
 	//atts := make(map[string]interface{})
-	//log.Println("resp: ")
-	//PrintJson(resp)
+	log.Println("resp: ")
+	PrintJson(resp)
+	log.Println("nr: ")
+	PrintJson(nr)
+
 	for idx, results := range resp.MetricDataResults {
 		log.Println("Metric Result--------------->")
 		PrintJson(results)
+
+		labels := strings.Split(*results.Label, ":")
+		requestId, err := strconv.Atoi(labels[0])
+		if err != nil {
+			log.Println("Error converting label to int")
+			continue
+		}
 		if len(results.Timestamps) == 0 {
 			//m.logger.Debug("no data points found for metric", zap.String("metric", nr[idx].MetricName))
 			// continue
@@ -341,15 +369,15 @@ func (m *metricReceiver) parseMetrics(ctx context.Context, nowts pcommon.Timesta
 			results.Timestamps = append(results.Timestamps, now)
 			results.Values = append(results.Values, 0)
 		} else {
-			log.Println("non-empty----------->")
+			//log.Println("non-empty----------->")
 		}
 
-		standardUnit := FetchStandardUnit(nr[idx].Namespace, nr[idx].MetricName)
+		standardUnit := FetchStandardUnit(nr[requestId].Namespace, nr[requestId].MetricName)
 		otelUnit := FetchOtelUnit(standardUnit)
 
 		mdp := ms.AppendEmpty()
-		mdp.SetName(fmt.Sprintf("%s.%s", nr[idx].Namespace, nr[idx].MetricName))
-		mdp.SetDescription(fmt.Sprintf("CloudWatch metric %s", nr[idx].MetricName))
+		mdp.SetName(fmt.Sprintf("%s.%s", nr[requestId].Namespace, nr[requestId].MetricName))
+		mdp.SetDescription(fmt.Sprintf("CloudWatch metric %s", nr[requestId].MetricName))
 		dps := mdp.SetEmptyGauge().DataPoints()
 
 		// number of values *always* equals number of timestamps
@@ -363,17 +391,19 @@ func (m *metricReceiver) parseMetrics(ctx context.Context, nowts pcommon.Timesta
 			dp.SetTimestamp(nowts)
 			dp.SetStartTimestamp(pcommon.NewTimestampFromTime(ts))
 			dp.SetDoubleValue(value)
-			log.Println("Namespace : ", nr[idx].Namespace, ", Metric : ", nr[idx].MetricName, ", Value : ", value)
+			log.Println("Namespace : ", nr[requestId].Namespace, ", Metric : ", nr[requestId].MetricName, ", Value : ", value)
 			for _, dim := range nr[idx].Dimensions {
 				dp.Attributes().PutStr(*dim.Name, *dim.Value)
 			}
-			dp.Attributes().PutStr("Namespace", nr[idx].Namespace)
-			dp.Attributes().PutStr("MetricName", nr[idx].MetricName)
+
+			dp.Attributes().PutStr("Namespace", nr[requestId].Namespace)
+			dp.Attributes().PutStr("MetricName", nr[requestId].MetricName)
 			dp.Attributes().PutStr("AWSUnit", string(standardUnit))
 			dp.Attributes().PutStr("OTELUnit", otelUnit)
 		}
 		mdp.SetUnit(otelUnit)
 	}
+
 	return pdm
 }
 
@@ -395,6 +425,7 @@ func (m *metricReceiver) parseMetrics(ctx context.Context, nowts pcommon.Timesta
 		//PrintJson(out)
 		if err != nil {
 			return nil, err
+
 		}
 
 		for _, metric := range out.Metrics {
