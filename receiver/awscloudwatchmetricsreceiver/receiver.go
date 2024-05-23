@@ -422,12 +422,18 @@ func (m *metricReceiver) parseMetrics(ctx context.Context, nowts pcommon.Timesta
 func (m *metricReceiver) autoDiscoverRequests(ctx context.Context, auto *AutoDiscoverConfig) ([]request, error) {
 	m.logger.Debug("discovering metrics", zap.String("namespace", auto.Namespace))
 
+	cwInput := cloudwatch.ListMetricsInput{
+		Namespace: aws.String(auto.Namespace),
+		//RecentlyActive: "PT3H",
+	}
+
+	if auto.Namespace != "AWS/S3" {
+		cwInput.RecentlyActive = "PT3H"
+	}
+
 	var requests []request
 	// Step1: Work similar to ListMetrics()
-	paginator := cloudwatch.NewListMetricsPaginator(m.client, &cloudwatch.ListMetricsInput{
-		Namespace:      aws.String(auto.Namespace),
-		RecentlyActive: "PT3H",
-	})
+	paginator := cloudwatch.NewListMetricsPaginator(m.client, &cwInput)
 	for paginator.HasMorePages() {
 		if len(requests) > auto.Limit {
 			m.logger.Debug(auto.Namespace + ": reached limit of number of metrics, try increasing the limit config to increase the number of individual metrics polled")
