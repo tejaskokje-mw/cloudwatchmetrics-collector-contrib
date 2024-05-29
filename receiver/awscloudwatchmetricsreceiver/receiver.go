@@ -14,8 +14,11 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/credentials"
+	"github.com/aws/aws-sdk-go-v2/credentials/stscreds"
 	"github.com/aws/aws-sdk-go-v2/service/cloudwatch"
 	"github.com/aws/aws-sdk-go-v2/service/cloudwatch/types"
+	"github.com/aws/aws-sdk-go-v2/service/sts"
 	"go.opentelemetry.io/collector/component"
 	"go.opentelemetry.io/collector/consumer"
 	"go.opentelemetry.io/collector/pdata/pcommon"
@@ -29,10 +32,18 @@ const (
 )
 
 type metricReceiver struct {
-	region        string
-	profile       string
-	imdsEndpoint  string
-	pollInterval  time.Duration
+	region       string
+	imdsEndpoint string
+	pollInterval time.Duration
+
+	pollingApproach string
+	profile         string
+	awsAccountId    string
+	awsRoleArn      string
+	externalId      string
+	awsAccessKey    string
+	awsSecretKey    string
+
 	nextStartTime time.Time
 	logger        *zap.Logger
 	client        client
@@ -51,10 +62,9 @@ type request struct {
 	Dimensions     []types.Dimension
 }
 
-// CloudWatchAPI is an interface to represent subset of AWS CloudWatch metrics functionality.
 type client interface {
-	GetMetricData(ctx context.Context, params *cloudwatch.GetMetricDataInput, optFns ...func(*cloudwatch.Options)) (*cloudwatch.GetMetricDataOutput, error)
 	ListMetrics(ctx context.Context, params *cloudwatch.ListMetricsInput, optFns ...func(*cloudwatch.Options)) (*cloudwatch.ListMetricsOutput, error)
+	GetMetricData(ctx context.Context, params *cloudwatch.GetMetricDataInput, optFns ...func(*cloudwatch.Options)) (*cloudwatch.GetMetricDataOutput, error)
 }
 
 func buildGetMetricDataQueries(metric *request, id int) types.MetricDataQuery {
@@ -70,7 +80,6 @@ func buildGetMetricDataQueries(metric *request, id int) types.MetricDataQuery {
 			},
 			Period: aws.Int32(int32(metric.Period / time.Second)),
 			Stat:   aws.String(metric.AwsAggregation),
-			//Unit:   FetchStandardUnit(metric.Namespace, metric.MetricName),
 		},
 	}
 }
@@ -92,7 +101,6 @@ func chunkSlice(requests []request, maxSize int) [][]request {
 // GetMetricData only allows 500 elements in a slice, otherwise we'll get validation error
 // Avoids making a network call for each metric configured
 func (m *metricReceiver) request(st, et time.Time) []cloudwatch.GetMetricDataInput {
-
 	chunks := chunkSlice(m.requests, maxNumberOfElements)
 	metricDataInput := make([]cloudwatch.GetMetricDataInput, len(chunks))
 
@@ -133,10 +141,18 @@ func newMetricReceiver(cfg *Config, logger *zap.Logger, consumer consumer.Metric
 	}
 
 	return &metricReceiver{
-		region:        cfg.Region,
-		profile:       cfg.Profile,
-		imdsEndpoint:  cfg.IMDSEndpoint,
-		pollInterval:  cfg.PollInterval,
+		region:       cfg.Region,
+		imdsEndpoint: cfg.IMDSEndpoint,
+		pollInterval: cfg.PollInterval,
+
+		pollingApproach: cfg.PollingApproach,
+		profile:         cfg.Profile,
+		awsAccountId:    cfg.AwsAccountId,
+		awsRoleArn:      cfg.AwsRoleArn,
+		externalId:      cfg.ExternalId,
+		awsAccessKey:    cfg.AwsAccessKey,
+		awsSecretKey:    cfg.AwsSecretKey,
+
 		nextStartTime: time.Now().Add(-cfg.PollInterval),
 		logger:        logger,
 		autoDiscover:  cfg.Metrics.AutoDiscover,
@@ -237,7 +253,7 @@ func (m *metricReceiver) poll(ctx context.Context) error {
 	return nil
 }*/
 
-func (m *metricReceiver) pollForMetrics(ctx context.Context, startTime time.Time, endTime time.Time) error {
+func (m *metricReceiver) pollForMetrics(ctx context.Context, startTime, endTime time.Time) error {
 	select {
 	case _, ok := <-m.doneChan:
 		if !ok {
@@ -268,22 +284,6 @@ func (m *metricReceiver) pollForMetrics(ctx context.Context, startTime time.Time
 	return nil
 }
 
-func (m *metricReceiver) getAWSAccessKeyID(ctx context.Context) (string, error) {
-	// Load AWS SDK configuration from default sources
-	cfg, err := config.LoadDefaultConfig(ctx)
-	if err != nil {
-		return "", err
-	}
-
-	// Access AWS credentials
-	creds, err := cfg.Credentials.Retrieve(ctx)
-	if err != nil {
-		return "", err
-	}
-
-	return creds.AccessKeyID, nil
-}
-
 func convertValueAndUnit(value float64, standardUnit types.StandardUnit, otelUnit string) (float64, string) {
 	switch standardUnit {
 	case StandardUnitMinutes:
@@ -311,14 +311,12 @@ func (m *metricReceiver) parseMetrics(ctx context.Context, nowts pcommon.Timesta
 	resourceAttrs.PutStr(conventions.AttributeCloudProvider, conventions.AttributeCloudProviderAWS)
 	resourceAttrs.PutStr(conventions.AttributeCloudRegion, m.region)
 	resourceAttrs.PutStr("channel", conventions.AttributeCloudProviderAWS)
-
-	// Temporary for now, until we find cloud.account.id
-	accessKeyID, err := m.getAWSAccessKeyID(ctx)
-	if err != nil {
-		m.logger.Error("Error retrieving AWS credentials:", zap.Error(err))
-		return pdm
+	resourceAttrs.PutStr("polling_approach", m.pollingApproach)
+	if m.awsAccountId != "" {
+		resourceAttrs.PutStr("cloud.account.id", m.awsAccountId)
+	} else {
+		resourceAttrs.PutStr("cloud.account.id", "unknown")
 	}
-	resourceAttrs.PutStr("cloud.account.id", accessKeyID)
 
 	ilms := rm.ScopeMetrics()
 	ilm := ilms.AppendEmpty()
@@ -425,9 +423,10 @@ func (m *metricReceiver) autoDiscoverRequests(ctx context.Context, auto *AutoDis
 	cwInput := cloudwatch.ListMetricsInput{
 		Namespace: aws.String(auto.Namespace),
 		//RecentlyActive: "PT3H",
+
 	}
 
-	if auto.Namespace != "AWS/S3" {
+	if auto.Namespace != "AWS/S3" && auto.Namespace != "AWS/Lambda" {
 		cwInput.RecentlyActive = "PT3H"
 	}
 
@@ -461,15 +460,72 @@ func (m *metricReceiver) configureAWSClient(ctx context.Context) error {
 		return nil
 	}
 
-	// if "", helper functions (withXXX) ignores parameter
-	cfg, err := config.LoadDefaultConfig(ctx,
+	var (
+		cfg aws.Config
+		err error
+	)
+
+	switch m.pollingApproach {
+	case "profiling":
+		cfg, err = m.configureProfiling(ctx)
+		//creds, _ := cfg.Credentials.Retrieve(ctx)
+		//fmt.Println("profiling AccessKeyID--->", creds.AccessKeyID)
+	case "role_delegation":
+		cfg, err = m.configureRoleDelegation(ctx)
+	case "access_keys":
+		cfg, err = m.configureAccessKeys(ctx)
+	default:
+		return errors.New("incomplete AWS configuration: must define polling_approach as profiling | role_delegation | access_keys")
+	}
+
+	if err != nil {
+		return err
+	}
+
+	m.client = cloudwatch.NewFromConfig(cfg)
+	return nil
+}
+
+func (m *metricReceiver) configureProfiling(ctx context.Context) (aws.Config, error) {
+	return config.LoadDefaultConfig(ctx,
 		config.WithRegion(m.region),
 		config.WithSharedConfigProfile(m.profile),
 		config.WithEC2IMDSEndpoint(m.imdsEndpoint),
 	)
-	if err != nil {
-		return err
+}
+
+func (m *metricReceiver) configureRoleDelegation(ctx context.Context) (aws.Config, error) {
+	if m.externalId == "" {
+		return aws.Config{}, errors.New("ExternalId is missing")
 	}
-	m.client = cloudwatch.NewFromConfig(cfg)
-	return nil
+
+	cfg, err := config.LoadDefaultConfig(ctx,
+		config.WithRegion(m.region),
+		config.WithEC2IMDSEndpoint(m.imdsEndpoint),
+	)
+	if err != nil {
+		return cfg, err
+	}
+
+	stsClient := sts.NewFromConfig(cfg)
+	stsCredsProvider := stscreds.NewAssumeRoleProvider(stsClient, m.awsRoleArn, func(aro *stscreds.AssumeRoleOptions) {
+		aro.ExternalID = &m.externalId
+	})
+	cfg.Credentials = aws.NewCredentialsCache(stsCredsProvider)
+	return cfg, nil
+}
+
+func (m *metricReceiver) configureAccessKeys(ctx context.Context) (aws.Config, error) {
+	//config.WithSharedConfigProfile(m.profile),
+	return config.LoadDefaultConfig(ctx,
+		config.WithRegion(m.region),
+		config.WithEC2IMDSEndpoint(m.imdsEndpoint),
+		config.WithCredentialsProvider(
+			credentials.NewStaticCredentialsProvider(
+				m.awsAccessKey,
+				m.awsSecretKey,
+				"",
+			),
+		),
+	)
 }

@@ -19,11 +19,18 @@ var (
 
 // Config is the overall config structure for the awscloudwatchmetricsreceiver
 type Config struct {
-	Region       string         `mapstructure:"region"`
-	Profile      string         `mapstructure:"profile"`
-	IMDSEndpoint string         `mapstructure:"imds_endpoint"`
-	PollInterval time.Duration  `mapstructure:"poll_interval"`
-	Metrics      *MetricsConfig `mapstructure:"metrics"`
+	Region          string        `mapstructure:"region"`
+	IMDSEndpoint    string        `mapstructure:"imds_endpoint"`
+	PollInterval    time.Duration `mapstructure:"poll_interval"`
+	PollingApproach string        `mapstructure:"polling_approach"`
+	Profile         string        `mapstructure:"profile"`
+	AwsAccountId    string        `mapstructure:"aws_account_id"`
+	AwsRoleArn      string        `mapstructure:"aws_role_arn"`
+	ExternalId      string        `mapstructure:"external_id"`
+	AwsAccessKey    string        `mapstructure:"aws_access_key"`
+	AwsSecretKey    string        `mapstructure:"aws_secret_key"`
+
+	Metrics *MetricsConfig `mapstructure:"metrics"`
 }
 
 // MetricsConfig is the configuration for the metrics part of the receiver
